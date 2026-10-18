@@ -20,7 +20,9 @@ from typing import Any, Literal
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from .editorial import generate_editorial
@@ -28,10 +30,14 @@ from .editorial import generate_editorial
 ROOT = Path(__file__).resolve().parents[2]
 BACKEND = ROOT / "backend"
 ENGINE = BACKEND / "engine" / "trendsignal_scout_v6_6.py"
-DATA_DIR = BACKEND / "data"
+# Vercel functions are serverless and the deployment filesystem is read-only.
+# Use /tmp for transient cache/history; durable cross-instance history needs a DB service.
+IS_VERCEL = os.getenv("VERCEL", "").strip() == "1"
+DATA_DIR = Path(os.getenv("TRENDSIGNAL_DATA_DIR", "/tmp/trendsignal-scout")) if IS_VERCEL else BACKEND / "data"
 RUNS_DIR = DATA_DIR / "runs"
 CACHE_DIR = DATA_DIR / "cache"
 DB_PATH = DATA_DIR / "history.sqlite3"
+FRONTEND_DIST = ROOT / "frontend" / "dist"
 load_dotenv(ROOT / ".env", override=False)
 load_dotenv(BACKEND / ".env", override=False)
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
@@ -345,11 +351,17 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="TrendSignal Scout", version="1.2.0", description="Radar de tendencias y decisiones editoriales trazables", lifespan=lifespan)
-@app.get("/", response_class=HTMLResponse, include_in_schema=False)
-async def home():
-    # The React frontend runs independently through Vite on port 5173.
-    return HTMLResponse("""<!doctype html><html lang=\"es\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>TrendSignal Scout · API</title><style>body{font:16px system-ui;background:#f7f8f4;color:#28463b;margin:0;display:grid;min-height:100vh;place-items:center}.card{max-width:540px;margin:24px;background:#fff;border:1px solid #e1e9e0;border-radius:18px;padding:32px;box-shadow:0 15px 50px #233d3012}h1{font-size:28px;margin:0 0 12px}p{color:#6e8176;line-height:1.7}a{display:inline-block;background:#347f72;color:white;padding:11px 16px;border-radius:9px;text-decoration:none;font-weight:700;margin:6px 8px 0 0;font-size:14px}.tag{display:inline-block;border-radius:30px;background:#eaf5ed;color:#46866d;padding:6px 10px;font-size:12px;font-weight:700}</style></head><body><main class=\"card\"><span class=\"tag\">BACKEND · API REST</span><h1>TrendSignal Scout</h1><p>El backend está separado del frontend React. Arranca el frontend con <code>npm run dev</code> dentro de <code>frontend/</code> y accede a la aplicación en el puerto 5173.</p><a href=\"http://127.0.0.1:5173\">Abrir frontend React ↗</a><a href=\"/docs\">Documentación API ↗</a></main></body></html>""")
 
+# Permite que el frontend React, publicado en un dominio Vercel separado,
+# llame a este backend. En producción define FRONTEND_ORIGIN con el dominio exacto.
+_frontend_origin = os.getenv("FRONTEND_ORIGIN", "*").strip() or "*"
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[_frontend_origin] if _frontend_origin != "*" else ["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 @app.get("/api/health")
 async def health():
     key_configured = bool(os.getenv("OPENAI_API_KEY", "").strip())
@@ -469,3 +481,14 @@ async def download_run(run_id: str, format: Literal["json", "csv", "md"] = "json
 @app.get("/api/openapi.json", include_in_schema=False)
 async def openapi_json():
     return JSONResponse(app.openapi())
+
+
+# In production, serve the compiled React/Vite app from the same Vercel deployment.
+# Keep this mount last so explicit /api routes and /docs take precedence.
+if FRONTEND_DIST.is_dir() and (FRONTEND_DIST / "index.html").is_file():
+    app.mount("/", StaticFiles(directory=str(FRONTEND_DIST), html=True), name="frontend")
+else:
+    @app.get("/", response_class=HTMLResponse, include_in_schema=False)
+    async def home():
+        # Local backend-only fallback; `npm run dev` serves React on port 5173.
+        return HTMLResponse("""<!doctype html><html lang=\"es\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>TrendSignal Scout · API</title><style>body{font:16px system-ui;background:#f7f8f4;color:#28463b;margin:0;display:grid;min-height:100vh;place-items:center}.card{max-width:540px;margin:24px;background:#fff;border:1px solid #e1e9e0;border-radius:18px;padding:32px;box-shadow:0 15px 50px #233d3012}h1{font-size:28px;margin:0 0 12px}p{color:#6e8176;line-height:1.7}a{display:inline-block;background:#347f72;color:white;padding:11px 16px;border-radius:9px;text-decoration:none;font-weight:700;margin:6px 8px 0 0;font-size:14px}.tag{display:inline-block;border-radius:30px;background:#eaf5ed;color:#46866d;padding:6px 10px;font-size:12px;font-weight:700}</style></head><body><main class=\"card\"><span class=\"tag\">BACKEND · API REST</span><h1>TrendSignal Scout</h1><p>El backend está separado del frontend React. Arranca el frontend con <code>npm run dev</code> dentro de <code>frontend/</code> y accede a la aplicación en el puerto 5173.</p><a href=\"http://127.0.0.1:5173\">Abrir frontend React ↗</a><a href=\"/docs\">Documentación API ↗</a></main></body></html>""")

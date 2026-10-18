@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
+// API del backend separado (configurar VITE_API_URL en Vercel).
+const API_BASE = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
+
 const NAV_ITEMS = [
   { id: 'overview', label: 'Resumen', icon: 'bi-grid-1x2' },
   { id: 'radar', label: 'Radar de temas', icon: 'bi-activity' },
@@ -123,11 +126,11 @@ export default function App() {
 
   const showToast = useCallback((message) => { setToast(message); window.setTimeout(() => setToast(''), 3200); }, []);
   const refreshHealth = useCallback(async () => {
-    try { const res = await fetch('/api/health', { cache: 'no-store' }); if (!res.ok) throw new Error('API no disponible'); setHealth(await res.json()); }
+    try { const res = await fetch(`${API_BASE}/api/health`, { cache: 'no-store' }); if (!res.ok) throw new Error('API no disponible'); setHealth(await res.json()); }
     catch { setHealth({ status: 'offline', engine: false, openai_configured: false }); }
   }, []);
   const loadHistory = useCallback(async () => {
-    try { const res = await fetch('/api/history?limit=10'); if (res.ok) setHistory((await res.json()).runs || []); }
+    try { const res = await fetch(`${API_BASE}/api/history?limit=10`); if (res.ok) setHistory((await res.json()).runs || []); }
     catch { /* historial local opcional si el backend no está iniciado */ }
   }, []);
 
@@ -137,7 +140,7 @@ export default function App() {
     let active = true;
     const readProgress = async () => {
       try {
-        const response = await fetch('/api/progress', { cache: 'no-store' });
+        const response = await fetch(`${API_BASE}/api/progress`, { cache: 'no-store' });
         if (!response.ok) return;
         const data = await response.json();
         if (active) setProgress(data);
@@ -154,7 +157,7 @@ export default function App() {
     if (clean.length < 3) { setError('Escribe una pregunta algo más concreta para empezar.'); return; }
     setQuestion(clean); setError(''); setProgress({ status: 'running', stage: 'starting', label: 'Preparando la investigación', percent: 2, detail: 'Conectando con el backend…' }); setBusy(true); setWorkspace(true); setView('overview'); setSidebarOpen(false);
     try {
-      const response = await fetch('/api/analyze', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question: clean, ...settings }) });
+      const response = await fetch(`${API_BASE}/api/analyze`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question: clean, ...settings }) });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.detail || `La API respondió con el código ${response.status}.`);
       setResult({ ...data, is_synthetic: false });
@@ -171,7 +174,7 @@ export default function App() {
 
   const loadRun = async (id) => {
     try {
-      const res = await fetch(`/api/runs/${encodeURIComponent(id)}`); const data = await res.json();
+      const res = await fetch(`${API_BASE}/api/runs/${encodeURIComponent(id)}`); const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'No se pudo recuperar el informe.');
       setResult({ ...data, is_synthetic: false }); setQuestion(data.question || ''); setView('overview'); setWorkspace(true); setSidebarOpen(false); showToast('Investigación recuperada del historial.');
     } catch (e) { showToast(e.message || 'No se pudo abrir la investigación.'); }
@@ -179,15 +182,51 @@ export default function App() {
 
   const exportReport = (format) => {
     if (!result) { showToast('Primero ejecuta una investigación.'); return; }
-    if (!result.is_synthetic && result.run_id) { window.location.href = `/api/runs/${encodeURIComponent(result.run_id)}/download?format=${encodeURIComponent(format)}`; return; }
-    const base = `trendsignal-demo-${format}`;
-    if (format === 'json') downloadText(JSON.stringify(result, null, 2), 'application/json;charset=utf-8', `${base}.json`);
-    else if (format === 'csv') {
-      const keys = ['evidence_id', 'source', 'title', 'summary', 'url', 'published', 'topic', 'subtopic'];
-      const csv = [keys.join(','), ...(result.items || []).map(row => keys.map(k => `"${String(row[k] ?? '').replace(/"/g, '""')}"`).join(','))].join('\r\n');
+    // Export the current report in the browser. This avoids relying on serverless /tmp
+    // files that are not guaranteed to persist between Vercel function invocations.
+    const base = `trendsignal-${slug(result.question || 'informe')}`;
+    if (format === 'json') {
+      downloadText(JSON.stringify(result, null, 2), 'application/json;charset=utf-8', `${base}.json`);
+    } else if (format === 'csv') {
+      const keys = ['evidence_id', 'source', 'collection_method', 'title', 'summary', 'url', 'published', 'topic', 'subtopic', 'date_status', 'metric_eligible', 'classification_method', 'needs_review', 'domain_group'];
+      const cell = (value) => `"${String(value ?? '').replace(/"/g, '""')}"`;
+      const csv = [keys.map(cell).join(','), ...(result.items || []).filter(row => !row.is_time_series).map(row => keys.map(k => cell(row[k])).join(','))].join('\r\n');
       downloadText('\ufeff' + csv, 'text/csv;charset=utf-8', `${base}.csv`);
-    } else downloadText(`# TrendSignal Scout · DEMO\n\n${result.question}\n\n${result.editorial?.executive_summary || result.narrative}\n\nDatos sintéticos: no utilizar como evidencia real.`, 'text/markdown;charset=utf-8', `${base}.md`);
-    showToast('Exportación de demostración: contiene datos sintéticos.');
+    } else {
+      const m = result.metrics || {};
+      const lines = [
+        '# TrendSignal Scout — Informe de investigación', '',
+        `**Pregunta:** ${result.question || ''}`, '',
+        `**Fecha:** ${result.created_at || ''}  `,
+        `**Región:** ${result.region || ''} · **Ventana:** ${result.days || ''} días`, '',
+        '> Las métricas describen la muestra recuperada; no equivalen al universo de publicaciones ni prueban por sí solas crecimiento global.', '',
+        '## Resumen ejecutivo', '', result.editorial?.executive_summary || result.narrative || 'No disponible.', '',
+        '## Métricas de la muestra', '',
+        `- Contenido único: ${m.fixed_content ?? m.unique_content ?? 0}`,
+        `- Fuentes con respuesta: ${m.sources_responding ?? 0}`,
+        `- Cobertura temporal: ${m.date_coverage_pct ?? 0}%`,
+        `- Registros complementarios de búsqueda web: ${m.discovery_records ?? 0}`, '',
+        '## Temas', '',
+        '| Tema | Registros | Cuota | Estado de evidencia |', '|---|---:|---:|---|',
+        ...(result.topics || []).map(t => `| ${String(t.topic || '').replace(/\|/g, '/')} | ${t.count ?? 0} | ${t.share_pct ?? 'N/D'}% | ${t.evidence_status || 'exploratorio'} |`), '',
+        '## Oportunidades editoriales', '',
+        ...(result.editorial?.opportunities || []).flatMap((op, i) => [
+          `### ${i + 1}. ${op.title || 'Oportunidad'}`, '',
+          `**Ángulo:** ${op.angle || 'N/D'}`, '', `**Gancho:** ${op.hook || 'N/D'}`, '',
+          `**Formato:** ${op.format || 'N/D'} · **Audiencia:** ${op.target_audience || 'N/D'}`, '',
+          op.evidence_summary || '', '',
+          ...(op.evidence || []).map(ev => `- [${ev.title || 'Evidencia'}](${ev.url || ''}) — ${ev.source || ''} (${ev.published || 'fecha no disponible'})`), '',
+          ...(op.validation_needed || []).map(v => `- Validar: ${v}`), ''
+        ]),
+        '## Fuentes consultadas', '',
+        '| Fuente | Estado | Registros |', '|---|---|---:|',
+        ...(result.sources || []).map(src => `| ${String(src.name || '').replace(/\|/g, '/')} | ${src.status || 'N/D'} | ${src.records ?? 0} |`), '',
+        '## Limitaciones', '',
+        ...(result.editorial?.limitations || result.warnings || ['Revisar las fuentes antes de publicar.']).map(x => `- ${x}`), ''
+      ];
+      downloadText(lines.join('\n'), 'text/markdown;charset=utf-8', `${base}.md`);
+    }
+    showToast(result.is_synthetic ? 'Exportación de demo: datos sintéticos.' : 'Informe exportado desde el navegador.');
   };
 
   const copyOpportunity = async (opportunity) => {
