@@ -27,15 +27,13 @@ from pydantic import BaseModel, Field, field_validator
 
 from .editorial import generate_editorial
 
-ROOT = Path(__file__).resolve().parents[2]
+APP_DIR = Path(__file__).resolve().parent
+BACKEND = APP_DIR.parent
 
-if (ROOT / "engine" / "trendsignal_scout_v6_6.py").exists():
-    BACKEND = ROOT
-elif (ROOT / "backend" / "engine" / "trendsignal_scout_v6_6.py").exists():
-    BACKEND = ROOT / "backend"
-else:
-    BACKEND = ROOT
+if BACKEND.name != "backend" and (BACKEND / "backend").is_dir():
+    BACKEND = BACKEND / "backend"
 
+ROOT = BACKEND.parent if BACKEND.name == "backend" else BACKEND
 ENGINE = BACKEND / "engine" / "trendsignal_scout_v6_6.py"
 # Vercel functions are serverless and the deployment filesystem is read-only.
 # Use /tmp for transient cache/history; durable cross-instance history needs a DB service.
